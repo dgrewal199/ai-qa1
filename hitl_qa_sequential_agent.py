@@ -1,15 +1,13 @@
 """
 Human-in-the-Loop Sequential QA Agent
-5-step workflow: File Upload -> Validation Selection -> Generate Test Cases
-               -> Human Review (test cases) -> Generate SQL
-               -> SQL Review Loop (approve/reject/modify + follow-up questions)
-
-KEY FIXES IN THIS VERSION:
-1. SQL agent now receives validation-type-specific pattern dynamically (fixes divergence)
-2. DynamicSQLAgent wrapper mirrors DynamicRequirementsAgent pattern
-3. SQL review is a persistent-session loop — agent remembers generated SQL across follow-ups
-4. Full approve/reject/modify + free-form Q&A loop with SQL agent
-5. Absolute imports throughout
+7-step workflow:
+  1. File Upload
+  2. Validation Selection
+  3. Generate Test Cases          (requirements_parser / dynamic_agent)
+  4. Test Case Review             (HITL)
+  5. Generate SQL                 (sql_generator / dynamic_sql_agent)
+  5b. Supervisor Critique + Fix   (supervisor / dynamic_supervisor_agent)
+  6. SQL Review Loop              (HITL — sees original + fixed SQL + critique report)
 """
 
 import os
@@ -30,6 +28,7 @@ from sql_generator.patterns import (
     UNIQUENESS_PATTERN,
     COLUMN_TRANSFORMATION_PATTERN,
 )
+from supervisor.agent import dynamic_supervisor_agent
 
 # ---------------------------------------------------------------------------
 # Config
@@ -37,76 +36,43 @@ from sql_generator.patterns import (
 INPUT_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input")
 
 # ---------------------------------------------------------------------------
-# DynamicSQLAgent — mirrors DynamicRequirementsAgent pattern
-# Swaps validation-type-specific few-shot pattern into instruction before use
+# DynamicSQLAgent
 # ---------------------------------------------------------------------------
-
-# Map validation type -> pattern constant from patterns.py
 _SQL_PATTERNS = {
     "ddl_validation":        DDL_VALIDATION_PATTERN,
     "completeness":          COMPLETENESS_PATTERN,
     "uniqueness":            UNIQUENESS_PATTERN,
     "column_transformation": COLUMN_TRANSFORMATION_PATTERN,
 }
-
-# Base instruction shared across all validation types — pulled from root_agent
 _SQL_BASE_INSTRUCTION = _base_sql_agent.instruction
 
 
 class DynamicSQLAgent:
-    """
-    Wraps the SQL generator agent and dynamically injects the correct
-    validation-type pattern into its instruction before each run.
-    Mirrors the DynamicRequirementsAgent pattern exactly.
-    """
-
     def __init__(self):
-        # Start with a copy of the base agent using default (column_transformation)
         self.current_validation_type = "column_transformation"
         self.agent = self._build_agent("column_transformation")
 
     def _build_agent(self, validation_type: str) -> Agent:
         pattern = _SQL_PATTERNS.get(validation_type, COLUMN_TRANSFORMATION_PATTERN)
-        instruction = f"{_SQL_BASE_INSTRUCTION}\n\n{pattern}"
+        if validation_type == "all":
+            pattern = "\n\n".join(_SQL_PATTERNS.values())
         return Agent(
             name=_base_sql_agent.name,
             model=_base_sql_agent.model,
             description=_base_sql_agent.description,
-            output_key=_base_sql_agent.output_key,        # "sql_generation_status"
+            output_key=_base_sql_agent.output_key,
             after_model_callback=_base_sql_agent.after_model_callback,
             tools=_base_sql_agent.tools,
-            instruction=instruction,
+            instruction=f"{_SQL_BASE_INSTRUCTION}\n\n{pattern}",
         )
 
     def update_for_validation_type(self, validation_type: str):
-        """Inject the correct pattern for this validation type — call before running."""
-        if validation_type == "all":
-            # Combine all patterns for 'all' validation
-            combined = "\n\n".join(_SQL_PATTERNS.values())
-            validation_type_key = "all"
-        else:
-            combined = None
-            validation_type_key = validation_type
-
-        if validation_type_key != self.current_validation_type:
-            if combined:
-                instruction = f"{_SQL_BASE_INSTRUCTION}\n\n{combined}"
-                self.agent = Agent(
-                    name=_base_sql_agent.name,
-                    model=_base_sql_agent.model,
-                    description=_base_sql_agent.description,
-                    output_key=_base_sql_agent.output_key,
-                    after_model_callback=_base_sql_agent.after_model_callback,
-                    tools=_base_sql_agent.tools,
-                    instruction=instruction,
-                )
-            else:
-                self.agent = self._build_agent(validation_type_key)
-            self.current_validation_type = validation_type_key
-            print(f"[DEBUG] DynamicSQLAgent updated for: {validation_type_key}")
+        if validation_type != self.current_validation_type:
+            self.agent = self._build_agent(validation_type)
+            self.current_validation_type = validation_type
+            print(f"[DEBUG] DynamicSQLAgent updated for: {validation_type}")
 
 
-# Singleton SQL agent wrapper
 dynamic_sql_agent = DynamicSQLAgent()
 
 # ---------------------------------------------------------------------------
@@ -114,10 +80,10 @@ dynamic_sql_agent = DynamicSQLAgent()
 # ---------------------------------------------------------------------------
 _uploaded_file_data: dict = {}
 
-# Persistent SQL runner + session — kept alive for review loop follow-ups
-_sql_runner: Optional[InMemoryRunner] = None
-_sql_session_id: Optional[str] = None
-_sql_user_id: str = "hitl_sql_user"
+# Persistent SQL agent session — kept alive across the review loop
+_sql_runner:     Optional[InMemoryRunner] = None
+_sql_session_id: Optional[str]           = None
+_sql_user_id:    str                     = "hitl_sql_user"
 
 
 def _store_file_content(filename: str, content: str) -> None:
@@ -145,18 +111,12 @@ def _request_file_upload() -> str:
 
 
 def _process_file_upload(file_data: str) -> str:
-    """
-    Read the actual file from input/ folder.
-    Pass the user's exact message text as file_data.
-    """
+    """Read the actual file from input/ folder. Pass user's exact message text."""
     print(f"[DEBUG] _process_file_upload called with: {repr(file_data)}")
 
     match = re.search(r'[\w\-. ]+\.(csv|xlsx|parquet|json)', file_data, re.IGNORECASE)
     if not match:
-        return (
-            "Error: No valid filename found. "
-            "Please provide a filename like 'mapping.csv' or 'balances.xlsx'."
-        )
+        return "Error: No valid filename found. Please provide a filename like 'mapping.csv'."
 
     filename = match.group(0).strip()
     file_path = os.path.join(INPUT_FOLDER, filename)
@@ -171,7 +131,7 @@ def _process_file_upload(file_data: str) -> str:
         except FileNotFoundError:
             files_list = f"input/ folder not found at {INPUT_FOLDER}"
         return (
-            f"Error: File '{filename}' not found in input/ folder. "
+            f"Error: '{filename}' not found in input/. "
             f"Available files: {files_list}"
         )
 
@@ -182,17 +142,15 @@ def _process_file_upload(file_data: str) -> str:
         elif filename.lower().endswith('.xlsx'):
             try:
                 import pandas as pd
-                df = pd.read_excel(file_path)
-                content = df.to_csv(index=False)
+                content = pd.read_excel(file_path).to_csv(index=False)
             except ImportError:
-                return "Error: pandas required. Run: pip install pandas openpyxl"
+                return "Error: Run: pip install pandas openpyxl"
         elif filename.lower().endswith('.parquet'):
             try:
                 import pandas as pd
-                df = pd.read_parquet(file_path)
-                content = df.to_csv(index=False)
+                content = pd.read_parquet(file_path).to_csv(index=False)
             except ImportError:
-                return "Error: pandas required. Run: pip install pandas pyarrow"
+                return "Error: Run: pip install pandas pyarrow"
         else:
             return f"Error: Unsupported format for '{filename}'."
     except Exception as e:
@@ -203,7 +161,7 @@ def _process_file_upload(file_data: str) -> str:
 
     _store_file_content(filename, content)
     print(f"[DEBUG] Loaded '{filename}'. First 200 chars:\n{content[:200]}")
-    return f"Success: File '{filename}' uploaded successfully and ready for processing."
+    return f"Success: File '{filename}' uploaded and ready for processing."
 
 
 # ---------------------------------------------------------------------------
@@ -214,46 +172,42 @@ def _request_validation_selection() -> str:
     """Show validation type menu."""
     return (
         "Please select validation type:\n"
-        "1. ddl_validation          - DDL Validation (database schema validation)\n"
-        "2. completeness            - Completeness Validation (data completeness checks)\n"
-        "3. uniqueness              - Uniqueness Validation (primary keys, no duplicates/nulls)\n"
-        "4. column_transformation   - Column Transformation Validation (source-to-target mappings)\n"
+        "1. ddl_validation          - DDL Validation (database schema)\n"
+        "2. completeness            - Completeness Validation (null/row counts)\n"
+        "3. uniqueness              - Uniqueness Validation (primary keys, duplicates)\n"
+        "4. column_transformation   - Column Transformation (source-to-target mappings)\n"
         "5. all                     - All Validations"
     )
 
 
 def _process_validation_selection(validation_choice: str) -> str:
     """
-    Store validation type and update BOTH agents with correct patterns.
-    Pass the user's exact text (e.g. '4' or 'column_transformation').
+    Store validation type and prime ALL three agents with correct patterns.
+    Pass user's exact text (e.g. '4' or 'column_transformation').
     """
     global _uploaded_file_data
 
     aliases = {
-        "1": "ddl_validation",
-        "2": "completeness",
-        "3": "uniqueness",
-        "4": "column_transformation",
-        "5": "all",
+        "1": "ddl_validation", "2": "completeness",
+        "3": "uniqueness",     "4": "column_transformation", "5": "all",
     }
     choice = aliases.get(validation_choice.strip(), validation_choice.strip())
-    valid = list(aliases.values())
+    valid  = list(aliases.values())
 
     if choice not in valid:
         return (
             f"Error: Invalid choice '{validation_choice}'. "
-            f"Please choose 1-5 or one of: {', '.join(valid)}"
+            f"Please choose 1-5 or: {', '.join(valid)}"
         )
 
     _uploaded_file_data["validation_type"] = choice
 
-    # Update requirements parser agent with correct few-shot examples
-    dynamic_agent.update_for_validation_type(choice)
+    # Prime all three agents at once
+    dynamic_agent.update_for_validation_type(choice)          # req parser
+    dynamic_sql_agent.update_for_validation_type(choice)      # sql generator
+    dynamic_supervisor_agent.update_for_validation_type(choice)  # supervisor
 
-    # Update SQL agent with correct pattern NOW — ready for step 5
-    dynamic_sql_agent.update_for_validation_type(choice)
-
-    print(f"[DEBUG] Both agents updated for validation type: {choice}")
+    print(f"[DEBUG] All 3 agents primed for: {choice}")
     return f"Success: Selected validation type '{choice}'. Generating test cases now..."
 
 
@@ -264,45 +218,40 @@ def _process_validation_selection(validation_choice: str) -> str:
 async def _generate_test_cases_from_file() -> str:
     """
     Generate QA test cases from the uploaded mapping file.
-    Sends real CSV content to dynamic_agent which parses it using its
-    loaded few-shot examples. No arguments needed.
+    Sends real CSV to dynamic_agent which parses it using loaded few-shot examples.
+    No arguments needed.
     """
-    file_content = _get_file_content()
+    file_content  = _get_file_content()
     validation_type = _uploaded_file_data.get("validation_type", "column_transformation")
-    filename = _uploaded_file_data.get("filename", "unknown")
+    filename      = _uploaded_file_data.get("filename", "unknown")
 
     if not file_content:
-        return "Error: No mapping file uploaded yet. Please upload a file first."
+        return "Error: No mapping file uploaded yet."
     if not validation_type:
-        return "Error: No validation type selected. Please select a validation type first."
+        return "Error: No validation type selected."
 
     print(f"[DEBUG] Generating '{validation_type}' test cases for '{filename}'")
 
-    # Safety net — re-apply if session was restarted
     if dynamic_agent.current_validation_type != validation_type:
         dynamic_agent.update_for_validation_type(validation_type)
 
-    runner = InMemoryRunner(agent=dynamic_agent.agent)
-    user_id = "hitl_req_user"
+    runner     = InMemoryRunner(agent=dynamic_agent.agent)
+    user_id    = "hitl_req_user"
     session_id = f"hitl_req_session_{validation_type}"
 
     try:
         await runner.session_service.create_session(
-            app_name=runner.app_name,
-            user_id=user_id,
-            session_id=session_id,
+            app_name=runner.app_name, user_id=user_id, session_id=session_id,
         )
     except Exception:
         pass
 
-    cnv_message = types.Content(parts=[types.Part(text=file_content)])
     agent_text: list[str] = []
-    outputs: dict = {}
+    outputs:    dict      = {}
 
     async for event in runner.run_async(
-        user_id=user_id,
-        session_id=session_id,
-        new_message=cnv_message,
+        user_id=user_id, session_id=session_id,
+        new_message=types.Content(parts=[types.Part(text=file_content)]),
     ):
         if event.content and event.content.parts:
             for part in event.content.parts:
@@ -312,17 +261,16 @@ async def _generate_test_cases_from_file() -> str:
             outputs.update(event.actions.state_delta)
 
     requirements_json = outputs.get("requirements_json") or "\n".join(agent_text)
-
     if not requirements_json:
-        return "Error: No test cases generated. Please check your mapping file format."
+        return "Error: No test cases generated. Check your mapping file format."
 
-    print(f"[DEBUG] Test cases captured (first 300):\n{str(requirements_json)[:300]}")
+    print(f"[DEBUG] Test cases (first 300):\n{str(requirements_json)[:300]}")
     _uploaded_file_data["requirements_json"] = requirements_json
     return str(requirements_json)
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Human Review of Test Cases
+# Step 4 — Test Case Review (HITL)
 # ---------------------------------------------------------------------------
 
 def _confirm_test_cases(test_cases_json: str) -> str:
@@ -337,16 +285,13 @@ def _confirm_test_cases(test_cases_json: str) -> str:
 
 
 def _process_test_cases_confirmation(confirmation_data: str) -> str:
-    """
-    Process user's test case review decision.
-    Accepts: 'approve', 'reject', or JSON {"action":"modify","modified_content":"..."}
-    """
-    action = ""
+    """Process user's test case review decision."""
+    action   = ""
     modified = ""
 
     try:
         decision = json.loads(confirmation_data)
-        action = decision.get("action", "").lower()
+        action   = decision.get("action", "").lower()
         modified = decision.get("modified_content", "")
     except (json.JSONDecodeError, ValueError):
         action = confirmation_data.lower().strip()
@@ -356,45 +301,40 @@ def _process_test_cases_confirmation(confirmation_data: str) -> str:
     elif "modify" in action:
         if modified:
             _uploaded_file_data["requirements_json"] = modified
-            return "Success: Test cases modified and approved. Proceeding to SQL generation."
+            return "Success: Test cases modified. Proceeding to SQL generation."
         return "Error: Modification requested but no modified_content provided."
     elif "reject" in action:
         return "Rejected: Please go back to step 2 and select a validation type again."
     else:
-        return (
-            f"Error: Unrecognised response '{confirmation_data}'. "
-            "Please reply with 'approve', 'reject', or 'modify'."
-        )
+        return f"Error: Unrecognised response '{confirmation_data}'. Reply with 'approve', 'reject', or 'modify'."
 
 
 # ---------------------------------------------------------------------------
 # Step 5 — Generate SQL
-# Persistent session kept alive for the SQL review loop in step 6
 # ---------------------------------------------------------------------------
 
 async def _generate_sql_from_approved_test_cases() -> str:
     """
-    Generate BigQuery SQL from approved test cases.
-    Uses DynamicSQLAgent which has the correct validation-type pattern injected.
+    Generate BigQuery SQL from approved test cases using DynamicSQLAgent
+    (correct validation-type pattern already injected in step 2).
     Creates a persistent session reused throughout the SQL review loop.
     No arguments needed.
     """
     global _sql_runner, _sql_session_id
 
     requirements_json = _uploaded_file_data.get("requirements_json")
-    validation_type = _uploaded_file_data.get("validation_type", "column_transformation")
+    validation_type   = _uploaded_file_data.get("validation_type", "column_transformation")
 
     if not requirements_json:
-        return "Error: No approved test cases found. Please complete test case review first."
+        return "Error: No approved test cases found."
 
-    # Safety net — ensure SQL agent has correct pattern loaded
     if dynamic_sql_agent.current_validation_type != validation_type:
         dynamic_sql_agent.update_for_validation_type(validation_type)
 
-    print(f"[DEBUG] Generating SQL for '{validation_type}'. Test cases (first 150):\n{str(requirements_json)[:150]}")
+    print(f"[DEBUG] Generating SQL for '{validation_type}'")
 
-    # Create persistent runner + session for the entire SQL review loop
-    _sql_runner = InMemoryRunner(agent=dynamic_sql_agent.agent)
+    # Persistent runner — kept alive for the review loop
+    _sql_runner    = InMemoryRunner(agent=dynamic_sql_agent.agent)
     _sql_session_id = f"hitl_sql_session_{validation_type}"
 
     try:
@@ -406,14 +346,13 @@ async def _generate_sql_from_approved_test_cases() -> str:
     except Exception:
         pass
 
-    sql_message = types.Content(parts=[types.Part(text=str(requirements_json))])
     agent_text: list[str] = []
-    outputs: dict = {}
+    outputs:    dict      = {}
 
     async for event in _sql_runner.run_async(
         user_id=_sql_user_id,
         session_id=_sql_session_id,
-        new_message=sql_message,
+        new_message=types.Content(parts=[types.Part(text=str(requirements_json))]),
     ):
         if event.content and event.content.parts:
             for part in event.content.parts:
@@ -423,84 +362,263 @@ async def _generate_sql_from_approved_test_cases() -> str:
             outputs.update(event.actions.state_delta)
 
     result = outputs.get("sql_generation_status") or "\n".join(agent_text)
-
     if not result:
-        return "Error: No SQL generated. Please check your test cases format."
+        return "Error: No SQL generated. Check your test cases format."
 
-    # Store generated SQL for review step
     _uploaded_file_data["generated_sql"] = result
     return result
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — SQL Review Loop
-# approve/reject/modify + free-form Q&A with SQL agent (same persistent session)
+# Step 5b — Supervisor Critique + Auto-Fix
 # ---------------------------------------------------------------------------
 
-def _confirm_sql(generated_sql: str) -> str:
-    """Present generated SQL for human review."""
+async def _run_supervisor_critique() -> str:
+    """
+    Run the supervisor agent against the generated SQL.
+    Inputs: mapping CSV (source of truth) + test cases + generated SQL
+    Outputs: structured JSON critique with original + fixed SQL side by side.
+    No arguments needed — reads everything from state.
+    """
+    mapping_csv       = _get_file_content()
+    validation_type   = _uploaded_file_data.get("validation_type", "column_transformation")
+    test_cases        = _uploaded_file_data.get("requirements_json", "")
+    generated_sql     = _uploaded_file_data.get("generated_sql", "")
+
+    if not generated_sql:
+        return "Error: No generated SQL found. Please run SQL generation first."
+    if not mapping_csv:
+        return "Error: No mapping file content found."
+
+    if dynamic_supervisor_agent.current_validation_type != validation_type:
+        dynamic_supervisor_agent.update_for_validation_type(validation_type)
+
+    print(f"[DEBUG] Running supervisor critique for '{validation_type}'")
+
+    # Build supervisor input payload
+    supervisor_input = json.dumps({
+        "mapping_csv":    mapping_csv,
+        "validation_type": validation_type,
+        "test_cases":     test_cases,
+        "generated_sql":  generated_sql,
+    }, indent=2)
+
+    runner     = InMemoryRunner(agent=dynamic_supervisor_agent.agent)
+    user_id    = "hitl_supervisor_user"
+    session_id = f"hitl_supervisor_session_{validation_type}"
+
+    try:
+        await runner.session_service.create_session(
+            app_name=runner.app_name, user_id=user_id, session_id=session_id,
+        )
+    except Exception:
+        pass
+
+    agent_text: list[str] = []
+    outputs:    dict      = {}
+
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=types.Content(parts=[types.Part(text=supervisor_input)]),
+    ):
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                if part.text:
+                    agent_text.append(part.text)
+        if event.actions and event.actions.state_delta:
+            outputs.update(event.actions.state_delta)
+
+    raw = outputs.get("supervisor_result") or "\n".join(agent_text)
+
+    # Parse and store supervisor result
+    try:
+        # Strip markdown fences if model wrapped output despite instructions
+        clean = re.sub(r'```(?:json)?|```', '', raw).strip()
+        critique = json.loads(clean)
+        _uploaded_file_data["supervisor_critique"] = critique
+
+        # Store fixed SQL as the candidate for human review
+        if critique.get("sql_fixed"):
+            _uploaded_file_data["sql_fixed"] = critique["sql_fixed"]
+
+        print(f"[DEBUG] Supervisor status: {critique.get('overall_status')} | "
+              f"score: {critique.get('confidence_score')} | "
+              f"{critique.get('fix_summary')}")
+
+        return _format_supervisor_report(critique)
+
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[DEBUG] Supervisor JSON parse error: {e}\nRaw: {raw[:300]}")
+        # Return raw output so HITL can still review
+        return f"Supervisor completed (raw output):\n{raw}"
+
+
+def _format_supervisor_report(critique: dict) -> str:
+    """
+    Format the supervisor JSON into a readable report for the human reviewer.
+    Shows: status, score, issues grouped by severity, fix summary, manual review notes.
+    """
+    status  = critique.get("overall_status", "unknown").upper()
+    score   = critique.get("confidence_score", "N/A")
+    summary = critique.get("fix_summary", "")
+    notes   = critique.get("manual_review_notes", "")
+    issues  = critique.get("issues", [])
+
+    # Group issues by severity
+    critical = [i for i in issues if i.get("severity") == "critical"]
+    warnings = [i for i in issues if i.get("severity") == "warning"]
+    infos    = [i for i in issues if i.get("severity") == "info"]
+
+    lines = [
+        f"╔══════════════════════════════════════╗",
+        f"  SUPERVISOR REPORT — {status}",
+        f"  Confidence Score: {score}/100",
+        f"  {summary}",
+        f"╚══════════════════════════════════════╝",
+    ]
+
+    if critical:
+        lines.append(f"\n🔴 CRITICAL ISSUES ({len(critical)}):")
+        for i in critical:
+            lines.append(f"  [{i.get('test_case_id','?')}] {i.get('check_category','')}")
+            lines.append(f"    Finding:  {i.get('finding','')}")
+            if i.get("fix_status") == "auto_fixed":
+                lines.append(f"    ✅ Fixed:  {i.get('fix_description','')}")
+            else:
+                lines.append(f"    ❌ Unable to fix: {i.get('fix_blocked_reason','')}")
+
+    if warnings:
+        lines.append(f"\n🟡 WARNINGS ({len(warnings)}):")
+        for i in warnings:
+            lines.append(f"  [{i.get('test_case_id','?')}] {i.get('finding','')}")
+            if i.get("fix_status") == "auto_fixed":
+                lines.append(f"    ✅ Fixed: {i.get('fix_description','')}")
+
+    if infos:
+        lines.append(f"\nℹ️  INFO ({len(infos)}):")
+        for i in infos:
+            lines.append(f"  [{i.get('test_case_id','?')}] {i.get('finding','')}")
+
+    if notes:
+        lines.append(f"\n📋 MANUAL REVIEW NOTES:\n  {notes}")
+
+    lines.append("\nBoth original and fixed SQL are available for your review below.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — SQL Review Loop (HITL)
+# Shows supervisor report + original + fixed SQL
+# ---------------------------------------------------------------------------
+
+def _confirm_sql_with_critique(supervisor_report: str) -> str:
+    """
+    Present the supervisor critique report + both SQL versions for human review.
+    """
+    critique    = _uploaded_file_data.get("supervisor_critique", {})
+    sql_original = critique.get("sql_original", _uploaded_file_data.get("generated_sql", ""))
+    sql_fixed    = critique.get("sql_fixed", {})
+    overall      = critique.get("overall_status", "unknown")
+
+    # Format SQL sections
+    original_section = (
+        json.dumps(sql_original, indent=2)
+        if isinstance(sql_original, dict)
+        else str(sql_original)
+    )
+    fixed_section = (
+        json.dumps(sql_fixed, indent=2)
+        if isinstance(sql_fixed, dict)
+        else str(sql_fixed)
+    )
+
+    status_note = {
+        "pass":                    "✅ No issues found — SQL looks good.",
+        "fixed":                   "✅ All issues were auto-fixed.",
+        "manual_review_required":  "⚠️  Some issues could not be auto-fixed — please review carefully.",
+    }.get(overall, "")
+
     return (
-        f"Please review the generated SQL:\n\n{generated_sql}\n\n"
+        f"{supervisor_report}\n\n"
+        f"{status_note}\n\n"
+        f"{'─'*50}\n"
+        f"ORIGINAL SQL:\n{original_section}\n\n"
+        f"{'─'*50}\n"
+        f"FIXED SQL (supervisor auto-fixes applied):\n{fixed_section}\n\n"
+        f"{'─'*50}\n"
         "Choose an action:\n"
-        "1. 'approve'          - Approve SQL. Workflow complete.\n"
-        "2. 'reject'           - Reject and regenerate SQL from test cases\n"
-        "3. 'modify'           - Provide specific modification instructions\n"
-        "4. Ask any question   - Ask the SQL agent anything (e.g. 'Why did you use SAFE_CAST here?')\n"
-        "                        The agent remembers the SQL it generated."
+        "1. 'approve fixed'    - Approve the supervisor-fixed SQL\n"
+        "2. 'approve original' - Approve the original SQL as-is\n"
+        "3. 'reject'           - Reject and regenerate SQL from scratch\n"
+        "4. Ask any question   - Ask the SQL agent anything about the generated SQL\n"
+        "                        (e.g. 'Why did you use SAFE_CAST here?', 'Fix test case 3')\n"
+        "                        The SQL agent remembers the full context."
     )
 
 
 async def _process_sql_review(user_input: str) -> str:
     """
     Handle the SQL review loop.
-    Routes to approve/reject/modify or passes free-form questions
-    directly to the SQL agent on the same persistent session.
 
-    Pass the user's exact text as user_input.
+    Routes:
+    - 'approve fixed'    → store fixed SQL, workflow complete
+    - 'approve original' → store original SQL, workflow complete
+    - 'reject'           → clear session, trigger fresh SQL generation
+    - anything else      → send to SQL agent on persistent session (follow-up Q&A / modifications)
+
+    Pass user's exact text as user_input.
     """
     global _sql_runner, _sql_session_id
 
     action = user_input.lower().strip()
 
-    # ── Approve ──────────────────────────────────────────────────────────
+    # ── Approve fixed ─────────────────────────────────────────────────────
+    if "approve" in action and "fixed" in action:
+        fixed = _uploaded_file_data.get("sql_fixed", {})
+        _uploaded_file_data["approved_sql"] = fixed
+        return "Success: Supervisor-fixed SQL approved. Workflow complete! ✓"
+
+    # ── Approve original ──────────────────────────────────────────────────
+    if "approve" in action and "original" in action:
+        original = _uploaded_file_data.get("generated_sql", "")
+        _uploaded_file_data["approved_sql"] = original
+        return "Success: Original SQL approved. Workflow complete! ✓"
+
+    # Shorthand 'approve' with no qualifier — default to fixed if available
     if action == "approve" or action == "1":
+        fixed = _uploaded_file_data.get("sql_fixed")
+        approved = fixed if fixed else _uploaded_file_data.get("generated_sql", "")
+        _uploaded_file_data["approved_sql"] = approved
         return "Success: SQL approved. Workflow complete! ✓"
 
-    # ── Reject — regenerate SQL fresh ────────────────────────────────────
-    if action == "reject" or action == "2":
-        # Reset persistent session so next generation is clean
-        _sql_runner = None
+    # ── Reject — reset session, trigger fresh generation ──────────────────
+    if action in ("reject", "2"):
+        _sql_runner     = None
         _sql_session_id = None
         _uploaded_file_data.pop("generated_sql", None)
-        return "Rejected: Regenerating SQL. Please wait..."
+        _uploaded_file_data.pop("sql_fixed", None)
+        _uploaded_file_data.pop("supervisor_critique", None)
+        return "Rejected: Regenerating SQL from test cases. Please wait..."
 
-    # ── Modify or free-form question — send to SQL agent on same session ─
-    # This covers:
-    #   - "modify: add a null check for account_id"
-    #   - "why did you use SAFE_CAST here?"
-    #   - "can you add a comment explaining the JOIN?"
-    #   - "3" (modify option)
+    # ── Follow-up question or modification — send to SQL agent ────────────
     if not _sql_runner or not _sql_session_id:
-        return (
-            "Error: No active SQL session. "
-            "Please go back and generate SQL first."
-        )
+        return "Error: No active SQL session. Please regenerate SQL first."
 
-    print(f"[DEBUG] Sending to SQL agent on session '{_sql_session_id}': {user_input[:100]}")
+    # Strip 'modify:' prefix if present
+    message_text = re.sub(
+        r'^(modify\s*[:\-]?\s*)', '', user_input, flags=re.IGNORECASE
+    ).strip() or user_input
 
-    # Strip "modify:" prefix if present for cleaner agent input
-    message_text = re.sub(r'^(modify\s*[:\-]?\s*)', '', user_input, flags=re.IGNORECASE).strip()
-    if not message_text:
-        message_text = user_input
+    print(f"[DEBUG] SQL follow-up on session '{_sql_session_id}': {message_text[:100]}")
 
-    follow_up = types.Content(parts=[types.Part(text=message_text)])
     agent_text: list[str] = []
-    outputs: dict = {}
+    outputs:    dict      = {}
 
     async for event in _sql_runner.run_async(
         user_id=_sql_user_id,
         session_id=_sql_session_id,
-        new_message=follow_up,
+        new_message=types.Content(parts=[types.Part(text=message_text)]),
     ):
         if event.content and event.content.parts:
             for part in event.content.parts:
@@ -510,18 +628,19 @@ async def _process_sql_review(user_input: str) -> str:
             outputs.update(event.actions.state_delta)
 
     response = outputs.get("sql_generation_status") or "\n".join(agent_text)
-
     if not response:
         return "Error: No response from SQL agent."
 
-    # Update stored SQL if agent produced new output
+    # Update stored SQL with latest agent output
     _uploaded_file_data["generated_sql"] = response
 
     return (
         f"{response}\n\n"
-        "---\n"
-        "You can continue asking questions, type 'approve' to finish, "
-        "or 'reject' to regenerate."
+        "─────────────────────────────────────────\n"
+        "You can continue asking questions, or:\n"
+        "  'approve fixed'    — approve supervisor-fixed version\n"
+        "  'approve original' — approve this latest version\n"
+        "  'reject'           — regenerate from scratch"
     )
 
 
@@ -530,13 +649,9 @@ async def _process_sql_review(user_input: str) -> str:
 # ---------------------------------------------------------------------------
 
 class HITLQASequentialAgent:
-    """
-    HITL QA Sequential Agent.
-    6-step workflow orchestrated by the root LLM agent via tool calls.
-    """
 
     def __init__(self, name: str = "HITLQASequentialAgent"):
-        self.name = name
+        self.name   = name
         self._agent: Optional[Agent] = None
 
     def _ensure_agent(self) -> Agent:
@@ -545,54 +660,59 @@ class HITLQASequentialAgent:
                 name=self.name,
                 model="gemini-2.5-flash",
                 description=(
-                    "6-step HITL QA workflow: file upload → validation selection → "
-                    "test case generation → test case review → SQL generation → SQL review loop"
+                    "7-step HITL QA workflow with supervisor critique: "
+                    "file upload → validation selection → test case generation → "
+                    "test case review → SQL generation → supervisor critique → SQL review loop"
                 ),
                 instruction="""
-You are a sequential workflow orchestrator managing a 6-step Human-in-the-Loop QA process.
+You are a sequential workflow orchestrator managing a 7-step Human-in-the-Loop QA process.
 
 STRICT RULES:
-- Follow the steps IN ORDER. Do not skip or reorder steps.
+- Follow steps IN ORDER. Never skip or reorder.
 - NEVER generate test cases or SQL yourself — always call the designated tool.
-- Present ALL tool outputs verbatim to the user without modification.
+- Present ALL tool outputs verbatim without modification.
 - Wait for user input ONLY at steps 1, 2, 4, and 6.
-- NEVER pause between steps 2→3, 3→4, or 5→6.
+- Between steps 2→3, 3→4, 4b→5, 5→5b, 5b→6: proceed immediately without waiting.
 
 WORKFLOW:
 
 STEP 1 — File Upload:
-  - Call _request_file_upload to prompt the user.
-  - When the user provides a filename, call _process_file_upload(file_data="<their exact text>").
-  - Only proceed when result starts with "Success:".
+  - Call _request_file_upload.
+  - When user provides filename, call _process_file_upload(file_data="<their exact text>").
+  - Proceed only when result starts with "Success:".
 
 STEP 2 — Validation Selection:
-  - Call _request_validation_selection to show the menu.
-  - When user picks an option, call _process_validation_selection(validation_choice="<their input>").
-  - When result starts with "Success:", IMMEDIATELY call _generate_test_cases_from_file — do NOT wait.
+  - Call _request_validation_selection.
+  - When user picks option, call _process_validation_selection(validation_choice="<their input>").
+  - When result starts with "Success:", IMMEDIATELY call _generate_test_cases_from_file.
 
 STEP 3 — Generate Test Cases (no user wait):
   - Call _generate_test_cases_from_file() — no arguments.
-  - IMMEDIATELY pass its exact output to _confirm_test_cases — do NOT wait for user.
+  - IMMEDIATELY pass exact output to _confirm_test_cases.
 
-STEP 4 — Test Case Review:
-  - Call _confirm_test_cases(test_cases_json="<exact step 3 output>").
-  - Show result and wait for user: 'approve', 'reject', or 'modify'.
+STEP 4 — Test Case Review (HITL):
+  - Call _confirm_test_cases(test_cases_json="<step 3 output>").
+  - Wait for user: 'approve', 'reject', or 'modify'.
   - Call _process_test_cases_confirmation(confirmation_data="<user response>").
-  - If "Success:" → IMMEDIATELY call _generate_sql_from_approved_test_cases — do NOT wait.
+  - If "Success:" → IMMEDIATELY call _generate_sql_from_approved_test_cases.
   - If "Rejected:" → return to step 2.
 
 STEP 5 — Generate SQL (no user wait):
   - Call _generate_sql_from_approved_test_cases() — no arguments.
-  - IMMEDIATELY pass its exact output to _confirm_sql — do NOT wait for user.
+  - When complete, IMMEDIATELY call _run_supervisor_critique — do NOT show SQL to user yet.
 
-STEP 6 — SQL Review Loop:
-  - Call _confirm_sql(generated_sql="<exact step 5 output>").
-  - Show result and wait for user input.
-  - Call _process_sql_review(user_input="<exact user text>") for EVERY user response.
-  - If result is "Success: SQL approved" → workflow complete, congratulate the user.
-  - If result contains "Regenerating SQL" → call _generate_sql_from_approved_test_cases again (restart step 5).
-  - Otherwise → show the response and call _confirm_sql again with the updated SQL to continue the loop.
-  - STAY IN THIS LOOP until the user approves or rejects.
+STEP 5b — Supervisor Critique (no user wait):
+  - Call _run_supervisor_critique() — no arguments.
+  - When complete, IMMEDIATELY pass its output to _confirm_sql_with_critique.
+
+STEP 6 — SQL Review Loop (HITL):
+  - Call _confirm_sql_with_critique(supervisor_report="<step 5b output>").
+  - Show full output to user and wait for their response.
+  - Call _process_sql_review(user_input="<exact user text>") for EVERY response.
+  - If result contains "Workflow complete" → congratulate user, workflow done.
+  - If result contains "Regenerating SQL" → go back to step 5 (call _generate_sql_from_approved_test_cases).
+  - Otherwise → show response, call _confirm_sql_with_critique again to continue the loop.
+  - STAY IN THIS LOOP until user approves or rejects.
 """,
                 tools=[
                     _request_file_upload,
@@ -603,7 +723,8 @@ STEP 6 — SQL Review Loop:
                     _confirm_test_cases,
                     _process_test_cases_confirmation,
                     _generate_sql_from_approved_test_cases,
-                    _confirm_sql,
+                    _run_supervisor_critique,
+                    _confirm_sql_with_critique,
                     _process_sql_review,
                 ],
                 output_key="workflow_results",
@@ -616,4 +737,4 @@ STEP 6 — SQL Review Loop:
 
 # Singleton export
 _hitl_agent = HITLQASequentialAgent()
-root_agent = _hitl_agent.ensure_agent()
+root_agent  = _hitl_agent.ensure_agent()
