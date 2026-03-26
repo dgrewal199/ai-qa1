@@ -1,0 +1,4 @@
+google-cloud-aiplatform[adk,reasoner]>=1.128.0
+google-adk>=1.21.0
+python-dotenv
+google-genai
