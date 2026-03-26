@@ -1,23 +1,38 @@
 """
 Human-in-the-Loop Sequential QA Agent
 5-step workflow: File Upload -> Validation Selection -> Generate Test Cases -> Human Review -> Generate SQL
+
+FIX SUMMARY:
+- _process_file_upload: reads REAL file from input/ folder, NO mock content
+- _generate_test_cases_from_file: calls dynamic_agent.update_for_validation_type() FIRST,
+  then sends the RAW CSV content as the message (agent parses it internally)
+- Absolute imports to avoid "relative import beyond top-level package" error
+- Removed mock_content entirely
 """
 
-from typing import Dict, Any, Optional
+import os
 import json
 import asyncio
 import re
+from typing import Optional
 
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 from google.adk.agents import Agent
 
-# Import your existing agents
-from ..requirements_parser.agent import dynamic_agent
-from ..sql_generator.agent import root_agent as sql_agent
+# ── Absolute imports (fixes "relative import beyond top-level package") ──────
+from requirements_parser.agent import dynamic_agent
+from sql_generator.agent import root_agent as sql_agent
 
 # ---------------------------------------------------------------------------
-# Global state (mirrors logic_service.py pattern)
+# Config
+# ---------------------------------------------------------------------------
+
+# Folder where user CSV/XLSX files are stored — adjust if needed
+INPUT_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input")
+
+# ---------------------------------------------------------------------------
+# Global state
 # ---------------------------------------------------------------------------
 _uploaded_file_data: dict = {}
 
@@ -35,77 +50,110 @@ def _get_file_content() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 tools  — File Upload
+# Step 1 tools — File Upload
 # ---------------------------------------------------------------------------
 
 def _request_file_upload() -> str:
-    """Tool to request mapping file upload from user."""
-    return "Please upload your mapping file (.xlsx or .csv format). Accepted formats: .xlsx, .csv"
+    """Prompt the user to provide their mapping file."""
+    return (
+        "Please provide your mapping filename from the input/ folder "
+        "(e.g. 'balances.csv' or 'mapping.xlsx')."
+    )
 
 
 def _process_file_upload(file_data: str) -> str:
     """
-    Process the user's file upload.
+    Read the actual CSV/XLSX file from the input/ folder.
     Pass the user's exact message text as file_data (e.g. 'balances.csv').
     """
     print(f"[DEBUG] _process_file_upload called with: {repr(file_data)}")
-    try:
-        file_info = json.loads(file_data)
-        if isinstance(file_info, dict):
-            filename = file_info.get("filename", "")
-            content = file_info.get("content", "")
-            if not filename or not content:
-                return "Error: Invalid file data. Please ensure the file contains valid data."
-            _store_file_content(filename, content)
-            return f"Success: File '{filename}' uploaded successfully and ready for processing."
-        # json.loads succeeded but returned a plain string — treat as filename
-        file_data = str(file_info)
-    except (json.JSONDecodeError, ValueError):
-        pass
 
-    # Extract filename from whatever the LLM passed (handles quotes, extra text, etc.)
-    match = re.search(r'([\w\-. ]+\.(csv|xlsx))', file_data, re.IGNORECASE)
+    # ── Extract filename from whatever the user typed ──────────────────────
+    match = re.search(r'[\w\-. ]+\.(csv|xlsx|parquet|json)', file_data, re.IGNORECASE)
     if not match:
-        return "Error: No valid .csv or .xlsx filename found. Please provide a filename like 'mapping.csv'."
+        return (
+            "Error: No valid filename found. "
+            "Please provide a filename like 'mapping.csv' or 'balances.xlsx'."
+        )
 
     filename = match.group(0).strip()
+    file_path = os.path.join(INPUT_FOLDER, filename)
 
-    # Testing fallback: generate mock CSV content matching requirements parser expectations
-    base = filename.replace('.csv', '').replace('.xlsx', '')
-    mock_content = f"""Primary key : account_id + balance_date
-source_table,target_table,source_column_name,target_column_name,source_column_datatype,target_column_datatype,business_rules
-{base},iam_account_balances,account_number,account_id,STRING,STRING,Direct mapping from source account number to target account ID
-{base},iam_account_balances,balance_amount,current_balance,DECIMAL,DECIMAL,SAFE_CAST balance amount to decimal with 2 decimal places
-{base},iam_account_balances,balance_date,balance_date,DATE,DATE,Direct mapping of balance date
-{base},iam_account_balances,,client_id,STRING,STRING,Lookup client ID from reference table client_master on account_number = contract_no
-{base},iam_account_balances,,country_code,STRING,STRING,Default value 'MK' for all records
-{base},iam_account_balances,,created_timestamp,TIMESTAMP,TIMESTAMP,System generated current timestamp"""
+    print(f"[DEBUG] Looking for file at: {file_path}")
 
-    _store_file_content(filename, mock_content)
+    # ── Read the REAL file — no mock content ──────────────────────────────
+    if not os.path.exists(file_path):
+        try:
+            available = [
+                f for f in os.listdir(INPUT_FOLDER)
+                if f.endswith(('.csv', '.xlsx', '.parquet', '.json'))
+            ]
+            files_list = ', '.join(available) if available else 'none found'
+        except FileNotFoundError:
+            files_list = f"input/ folder not found at {INPUT_FOLDER}"
+        return (
+            f"Error: File '{filename}' not found in input/ folder. "
+            f"Available files: {files_list}"
+        )
+
+    try:
+        if filename.lower().endswith(('.csv', '.txt', '.json')):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+        elif filename.lower().endswith('.xlsx'):
+            try:
+                import pandas as pd
+                df = pd.read_excel(file_path)
+                content = df.to_csv(index=False)
+            except ImportError:
+                return "Error: pandas is required to read .xlsx files. Run: pip install pandas openpyxl"
+
+        elif filename.lower().endswith('.parquet'):
+            try:
+                import pandas as pd
+                df = pd.read_parquet(file_path)
+                content = df.to_csv(index=False)
+            except ImportError:
+                return "Error: pandas is required to read .parquet files. Run: pip install pandas pyarrow"
+
+        else:
+            return f"Error: Unsupported file format for '{filename}'."
+
+    except Exception as e:
+        return f"Error reading file '{filename}': {str(e)}"
+
+    if not content.strip():
+        return f"Error: File '{filename}' is empty."
+
+    _store_file_content(filename, content)
+    print(f"[DEBUG] File loaded. First 200 chars:\n{content[:200]}")
     return f"Success: File '{filename}' uploaded successfully and ready for processing."
 
 
 # ---------------------------------------------------------------------------
-# Step 2 tools  — Validation Selection
+# Step 2 tools — Validation Selection
 # ---------------------------------------------------------------------------
 
 def _request_validation_selection() -> str:
-    """Tool to show validation type menu to user."""
+    """Show validation type menu to user."""
     return (
-        "Please select validation type for test case generation.\n"
-        "1. ddl_validation  - DDL Validation (database schema validation)\n"
-        "2. completeness    - Completeness Validation (data completeness checks)\n"
-        "3. uniqueness      - Uniqueness Validation (verify primary keys, no duplicates/nulls)\n"
-        "4. column_transformation - Column Transformation Validation (verify source-to-target mappings)\n"
-        "5. all             - All Validations"
+        "Please select validation type for test case generation:\n"
+        "1. ddl_validation          - DDL Validation (database schema validation)\n"
+        "2. completeness            - Completeness Validation (data completeness checks)\n"
+        "3. uniqueness              - Uniqueness Validation (primary keys, no duplicates/nulls)\n"
+        "4. column_transformation   - Column Transformation Validation (source-to-target mappings)\n"
+        "5. all                     - All Validations"
     )
 
 
 def _process_validation_selection(validation_choice: str) -> str:
     """
-    Store the user's validation type choice.
-    Pass the user's exact text as validation_choice (e.g. '4' or 'column_transformation').
+    Store the user's validation type and update dynamic_agent instructions.
+    Pass the user's exact text (e.g. '4' or 'column_transformation').
     """
+    global _uploaded_file_data
+
     aliases = {
         "1": "ddl_validation",
         "2": "completeness",
@@ -114,43 +162,53 @@ def _process_validation_selection(validation_choice: str) -> str:
         "5": "all",
     }
     choice = aliases.get(validation_choice.strip(), validation_choice.strip())
-    valid = ["ddl_validation", "completeness", "uniqueness", "column_transformation", "all"]
-    if choice not in valid:
-        return f"Error: Invalid choice '{validation_choice}'. Please choose 1-5 or: {', '.join(valid)}"
+    valid = list(aliases.values())
 
-    global _uploaded_file_data
+    if choice not in valid:
+        return (
+            f"Error: Invalid choice '{validation_choice}'. "
+            f"Please choose 1-5 or one of: {', '.join(valid)}"
+        )
+
     _uploaded_file_data["validation_type"] = choice
-    return f"Success: Selected validation type '{choice}' for test case generation."
+
+    # ── Update dynamic_agent NOW so correct few-shot examples are loaded ──
+    # This calls get_instructions_with_patterns(validation_type) internally
+    dynamic_agent.update_for_validation_type(choice)
+    print(f"[DEBUG] dynamic_agent updated for validation type: {choice}")
+
+    return f"Success: Selected validation type '{choice}'. Generating test cases now..."
 
 
 # ---------------------------------------------------------------------------
-# Step 3 tool  — Generate Test Cases  (THIS is the key fix)
-# Called as a tool by the root_agent LLM.
-# Uses InMemoryRunner + run_async to properly capture output_key="requirements_json"
-# from the session state delta, exactly like logic_service.py
+# Step 3 tool — Generate Test Cases
 # ---------------------------------------------------------------------------
 
 async def _generate_test_cases_from_file() -> str:
     """
-    Tool to generate QA test cases from the uploaded mapping file.
-    Calls the requirements parser agent with the file content and selected validation type.
-    No arguments needed — reads from uploaded file and selected validation type.
+    Generate QA test cases from the uploaded mapping file.
+    - Reads REAL CSV content from state (loaded in step 1)
+    - dynamic_agent already has correct validation instructions (set in step 2)
+    - Sends raw CSV as message; dynamic_agent parses it using prompts_integrated.py
     """
     file_content = _get_file_content()
     validation_type = _uploaded_file_data.get("validation_type", "column_transformation")
+    filename = _uploaded_file_data.get("filename", "unknown")
 
     if not file_content:
         return "Error: No mapping file uploaded yet. Please upload a file first."
     if not validation_type:
         return "Error: No validation type selected. Please select a validation type first."
 
-    print(f"[DEBUG] Generating test cases. Validation: {validation_type}")
-    print(f"[DEBUG] File content (first 150): {file_content[:150]}")
+    print(f"[DEBUG] Generating '{validation_type}' test cases for '{filename}'")
+    print(f"[DEBUG] CSV content (first 300 chars):\n{file_content[:300]}")
 
-    # Configure agent for validation type — same as logic_service.py
-    dynamic_agent.update_for_validation_type(validation_type)
+    # Safety net: re-apply validation type if session was restarted
+    if dynamic_agent.current_validation_type != validation_type:
+        dynamic_agent.update_for_validation_type(validation_type)
+        print(f"[DEBUG] Re-applied validation type: {validation_type}")
 
-    # Create a fresh InMemoryRunner session for this call — same as logic_service.py
+    # ── Fresh InMemoryRunner session ──────────────────────────────────────
     runner = InMemoryRunner(agent=dynamic_agent.agent)
     user_id = "hitl_req_user"
     session_id = f"hitl_req_session_{validation_type}"
@@ -162,9 +220,9 @@ async def _generate_test_cases_from_file() -> str:
             session_id=session_id,
         )
     except Exception:
-        pass  # Session already exists from a prior call
+        pass  # Session already exists
 
-    # Wrap as types.Content — same as logic_service.py
+    # ── Send REAL CSV content — dynamic_agent parses it internally ────────
     cnv_message = types.Content(parts=[types.Part(text=file_content)])
 
     agent_text: list[str] = []
@@ -179,75 +237,85 @@ async def _generate_test_cases_from_file() -> str:
             for part in event.content.parts:
                 if part.text:
                     agent_text.append(part.text)
-        # output_key="requirements_json" is emitted here as a state_delta
+        # Capture output_key="requirements_json" from state_delta
         if event.actions and event.actions.state_delta:
             outputs.update(event.actions.state_delta)
 
-    # Prefer state_delta result (structured JSON), fall back to text
+    # Prefer structured state_delta output, fall back to raw agent text
     requirements_json = outputs.get("requirements_json") or "\n".join(agent_text)
-    print(f"[DEBUG] requirements_json captured: {str(requirements_json)[:300]}")
 
-    # Store for SQL generation step
+    if not requirements_json:
+        return "Error: No test cases generated. Please check your mapping file format."
+
+    print(f"[DEBUG] requirements_json captured (first 300):\n{str(requirements_json)[:300]}")
+
     _uploaded_file_data["requirements_json"] = requirements_json
     return str(requirements_json)
 
 
 # ---------------------------------------------------------------------------
-# Step 4 tools  — Human Review
+# Step 4 tools — Human Review
 # ---------------------------------------------------------------------------
 
 def _confirm_test_cases(test_cases_json: str) -> str:
-    """Tool for human review of generated test cases."""
+    """Present generated test cases for human review."""
     return (
         f"Please review the generated test cases:\n\n{test_cases_json}\n\n"
         "Choose an action:\n"
-        "1. 'approve'  - Approve test cases as-is\n"
-        "2. 'reject'   - Reject and restart\n"
-        "3. 'modify'   - Provide modified test cases"
+        "1. 'approve' - Approve test cases as-is\n"
+        "2. 'reject'  - Reject and regenerate\n"
+        "3. 'modify'  - Provide your modified test cases JSON"
     )
 
 
 def _process_test_cases_confirmation(confirmation_data: str) -> str:
     """
-    Process the user's approval decision.
-    Pass the user's exact text as confirmation_data (e.g. 'approve', 'reject', or 'modify').
+    Process the user's review decision.
+    Accepts: 'approve', 'reject', or JSON like {"action":"modify","modified_content":"..."}
     """
+    action = ""
+    modified = ""
+
     try:
         decision = json.loads(confirmation_data)
-        action = decision.get("action", "reject").lower()
+        action = decision.get("action", "").lower()
+        modified = decision.get("modified_content", "")
     except (json.JSONDecodeError, ValueError):
         action = confirmation_data.lower().strip()
 
-    if action == "approve":
-        return "Success: Test cases approved by user and ready for SQL generation."
-    elif action == "modify":
-        try:
-            decision_dict = json.loads(confirmation_data)
-            modified = decision_dict.get("modified_content", "")
-        except (json.JSONDecodeError, AttributeError):
-            modified = ""
+    if "approve" in action:
+        return "Success: Test cases approved and ready for SQL generation."
+
+    elif "modify" in action:
         if modified:
             _uploaded_file_data["requirements_json"] = modified
-            return f"Success: Test cases modified and approved. Updated test cases: {modified}"
-        return "Error: Modification requested but no changes provided."
+            return "Success: Test cases modified and approved. Proceeding to SQL generation."
+        return "Error: Modification requested but no modified_content provided."
+
+    elif "reject" in action:
+        return "Test cases rejected. Please go back to step 2 and select a validation type again."
+
     else:
-        return "Test cases rejected by user. Please regenerate test cases or modify requirements."
+        return (
+            f"Error: Unrecognised response '{confirmation_data}'. "
+            "Please reply with 'approve', 'reject', or 'modify'."
+        )
 
 
 # ---------------------------------------------------------------------------
-# Step 5 tool  — Generate SQL  (calls SQL generator via InMemoryRunner)
+# Step 5 tool — Generate SQL
 # ---------------------------------------------------------------------------
 
 async def _generate_sql_from_approved_test_cases() -> str:
     """
-    Tool to generate BigQuery SQL from the approved test cases.
-    No arguments needed — reads from the stored approved test cases.
+    Generate BigQuery SQL from the approved test cases.
+    Reads from stored approved test cases — no arguments needed.
     """
     requirements_json = _uploaded_file_data.get("requirements_json")
     if not requirements_json:
-        return "Error: No approved test cases found. Please complete test case review first."
+        return "Error: No approved test cases found. Please complete the review step first."
 
-    print(f"[DEBUG] Generating SQL from test cases: {str(requirements_json)[:150]}")
+    print(f"[DEBUG] Generating SQL. Test cases (first 150):\n{str(requirements_json)[:150]}")
 
     runner = InMemoryRunner(agent=sql_agent)
     user_id = "hitl_sql_user"
@@ -260,7 +328,7 @@ async def _generate_sql_from_approved_test_cases() -> str:
             session_id=session_id,
         )
     except Exception:
-        pass  # Session already exists from a prior call
+        pass
 
     sql_message = types.Content(parts=[types.Part(text=str(requirements_json))])
     agent_text: list[str] = []
@@ -278,21 +346,20 @@ async def _generate_sql_from_approved_test_cases() -> str:
         if event.actions and event.actions.state_delta:
             outputs.update(event.actions.state_delta)
 
-    return outputs.get("sql_tests_json") or "\n".join(agent_text)
+    result = outputs.get("sql_tests_json") or "\n".join(agent_text)
+    if not result:
+        return "Error: No SQL generated. Please check your test cases format."
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Sequential Agent wrapper + root_agent export
+# Root Sequential Agent
 # ---------------------------------------------------------------------------
 
 class HITLQASequentialAgent:
     """
     HITL QA Sequential Agent.
-
-    The root_agent is an ADK Agent whose LLM orchestrates the 5-step workflow
-    by calling the registered tool functions in order.  Steps 3 and 5 use
-    async tools that call the requirements parser and SQL generator via
-    InMemoryRunner (same pattern as logic_service.py).
+    Root ADK Agent whose LLM orchestrates the 5-step workflow via tool calls.
     """
 
     def __init__(self, name: str = "HITLQASequentialAgent"):
@@ -315,35 +382,35 @@ STRICT RULES:
 - Follow the steps IN ORDER. Do not skip or reorder steps.
 - For steps 3 and 5, you MUST call the designated tool — do NOT generate test cases or SQL yourself.
 - Present ALL tool outputs verbatim to the user without modification.
-- Wait for user input ONLY at steps 1, 2, and 4. NEVER pause or return to the user between steps 2 and 3.
+- Wait for user input ONLY at steps 1, 2, and 4.
+- NEVER pause between steps 2 and 3 — call _generate_test_cases_from_file immediately after step 2 succeeds.
 
 WORKFLOW:
 
 STEP 1 — File Upload:
   - Call _request_file_upload to prompt the user.
-  - When the user responds with a filename (e.g. "balances.csv"), call _process_file_upload(file_data="balances.csv") passing the user's exact text.
-  - Only proceed to step 2 when _process_file_upload returns "Success:".
+  - When the user provides a filename, call _process_file_upload(file_data="<their exact text>").
+  - Only proceed to step 2 when the result starts with "Success:".
 
 STEP 2 — Validation Selection:
   - Call _request_validation_selection to show the menu.
-  - When the user selects an option (number 1-5 or the type name), call _process_validation_selection with their input.
-  - When _process_validation_selection returns "Success:", you MUST IMMEDIATELY call _generate_test_cases_from_file in the SAME response without stopping.
+  - When the user picks an option, call _process_validation_selection(validation_choice="<their input>").
+  - When the result starts with "Success:", IMMEDIATELY call _generate_test_cases_from_file in the same turn — do NOT wait.
 
 STEP 3 — Generate Test Cases:
-  - Call _generate_test_cases_from_file (no arguments).
-  - This tool reads the uploaded file and validation type automatically.
-  - Pass the EXACT output of this tool to _confirm_test_cases.
+  - Call _generate_test_cases_from_file() — no arguments.
+  - This reads the real CSV file and sends it to the requirements parser agent automatically.
+  - Pass the EXACT output to _confirm_test_cases.
 
 STEP 4 — Human Review:
-  - Call _confirm_test_cases with the test cases string from step 3.
-  - Show the output and wait for user to respond with 'approve', 'reject', or 'modify'.
-  - Call _process_test_cases_confirmation with the user's response.
-  - If approved → proceed to step 5.
-  - If rejected  → go back to step 2.
-  - If modified  → proceed to step 5 with the modified test cases.
+  - Call _confirm_test_cases(test_cases_json="<exact output from step 3>").
+  - Show the result to the user and wait for: 'approve', 'reject', or 'modify'.
+  - Call _process_test_cases_confirmation(confirmation_data="<user response>").
+  - If result starts with "Success:" → proceed to step 5.
+  - If "rejected" → return to step 2.
 
 STEP 5 — Generate SQL:
-  - Call _generate_sql_from_approved_test_cases (no arguments).
+  - Call _generate_sql_from_approved_test_cases() — no arguments.
   - Present the generated SQL to the user.
   - Workflow complete.
 """,
@@ -352,10 +419,10 @@ STEP 5 — Generate SQL:
                     _process_file_upload,
                     _request_validation_selection,
                     _process_validation_selection,
-                    _generate_test_cases_from_file,   # async — calls req parser via InMemoryRunner
+                    _generate_test_cases_from_file,
                     _confirm_test_cases,
                     _process_test_cases_confirmation,
-                    _generate_sql_from_approved_test_cases,  # async — calls sql generator via InMemoryRunner
+                    _generate_sql_from_approved_test_cases,
                 ],
                 output_key="workflow_results",
             )
@@ -365,6 +432,6 @@ STEP 5 — Generate SQL:
         return self._ensure_agent()
 
 
-# Singleton — imported by your ADK app / runner
+# Singleton export
 _hitl_agent = HITLQASequentialAgent()
 root_agent = _hitl_agent.ensure_agent()
