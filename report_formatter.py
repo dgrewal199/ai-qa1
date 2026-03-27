@@ -385,7 +385,7 @@ def print_execution_report(raw: Union[str, dict]) -> None:
     # Extract individual test case blocks
     # Look for patterns like "test_case_id: tc_001" or "- test_case_id: tc_001"
     tc_blocks = _re.split(
-        r"(?=(?:-\s+)?test_case_id\s*:|(?:-\s+)?"test_case_id"\s*:)",
+        r'(?=(?:-\s+)?test_case_id\s*:)',
         raw_str
     )
 
@@ -396,16 +396,11 @@ def print_execution_report(raw: Union[str, dict]) -> None:
         if not block.strip():
             continue
 
-        tc_id_m  = _re.search(r"test_case_id["\s]*:["\s]*([\w\-]+)",
-                               block, _re.IGNORECASE)
-        status_m = _re.search(r"execution_status["\s]*:["\s]*(\w+)",
-                               block, _re.IGNORECASE)
-        reason_m = _re.search(r"failure_reason["\s]*:["\s]*(.+?)(?:\n|$)",
-                               block, _re.IGNORECASE)
-        actual_m = _re.search(r"actual_values["\s]*:["\s]*(.+?)(?:\n|$)",
-                               block, _re.IGNORECASE)
-        expect_m = _re.search(r"expected_value["\s]*:["\s]*(.+?)(?:\n|$)",
-                               block, _re.IGNORECASE)
+        tc_id_m  = _re.search(r'test_case_id[\s]*:[\s]*([\w\-]+)', block, _re.IGNORECASE)
+        status_m = _re.search(r'execution_status[\s]*:[\s]*(\w+)', block, _re.IGNORECASE)
+        reason_m = _re.search(r'failure_reason[\s]*:[\s]*(.+?)(?:\n|$)', block, _re.IGNORECASE)
+        actual_m = _re.search(r'actual_values[\s]*:[\s]*(.+?)(?:\n|$)', block, _re.IGNORECASE)
+        expect_m = _re.search(r'expected_value[\s]*:[\s]*(.+?)(?:\n|$)', block, _re.IGNORECASE)
 
         if not tc_id_m:
             continue
