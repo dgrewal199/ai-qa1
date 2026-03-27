@@ -234,118 +234,221 @@ def print_single_sql(raw: Union[str, dict], test_case_id: str) -> bool:
 
 def print_execution_report(raw: Union[str, dict]) -> None:
     """
-    Print a clean, human-readable execution report to terminal.
+    Print a clean execution report from the ExecuteBQSQLAgent output.
 
-    Expects executor output in format:
-    {
-      "report_metadata": {...},
-      "summary": {
-          "total_tests": N, "passed": N, "failed": N,
-          "errors": N, "pass_rate_pct": N
-      },
-      "results": [
-          {
-            "test_case_id": "tc_001",
-            "description": "...",
-            "status": "PASS"|"FAIL"|"ERROR",
-            "mismatch_row_count": N,
-            "mismatch_examples": [...],
-            "error_message": "...",
-            "execution_time_ms": N
-          }
-      ]
-    }
+    The executor agent (output_key="execution_report_yaml") appends these
+    fields to each test case:
+        execution_status : PASSED | FAILED | SOFT_FAILURE
+        actual_values    : what BQ returned
+        expected_value   : what was expected
+        failure_reason   : why it failed
+
+    And ends with a FINAL EXECUTION SUMMARY section.
+
+    Handles both:
+      - JSON format: {"test_cases": [...], "summary": {...}}
+      - Plain text / YAML-like format from the agent
     """
-    report = _safe_parse(raw)
+    import re as _re
 
-    # Handle case where executor returned plain text (not JSON)
-    if not report or "results" not in report:
-        print(f"\n{WARN} Executor output (raw):\n{raw}")
+    # ── Try structured JSON first ─────────────────────────────────────────────
+    data = _safe_parse(raw)
+    test_cases = []
+    summary    = {}
+
+    if data and isinstance(data, dict):
+        test_cases = data.get("test_cases", [])
+        summary    = data.get("summary", data.get("execution_summary", {}))
+    elif data and isinstance(data, list):
+        test_cases = data
+
+    # ── If JSON worked and has test cases — use structured path ───────────────
+    if test_cases:
+        passed_list = [
+            tc for tc in test_cases
+            if str(tc.get("execution_status", "")).upper() == "PASSED"
+        ]
+        failed_list = [
+            tc for tc in test_cases
+            if str(tc.get("execution_status", "")).upper()
+            in ("FAILED", "SOFT_FAILURE")
+        ]
+
+        total     = len(test_cases)
+        passed    = len(passed_list)
+        failed    = len(failed_list)
+        pass_rate = round((passed / total * 100), 1) if total > 0 else 0
+
+        # Override with summary block if present
+        if summary:
+            total     = summary.get("total_test_cases_executed",
+                        summary.get("total", total))
+            passed    = summary.get("total_passed",
+                        summary.get("passed", passed))
+            failed    = summary.get("total_failed",
+                        summary.get("failed", failed))
+            pass_rate = round((passed / total * 100), 1) if total > 0 else 0
+
+        # Header
+        bar_len = 30
+        filled  = round((passed / total) * bar_len) if total > 0 else 0
+        bar     = ("█" * filled) + ("░" * (bar_len - filled))
+
+        print(f"\n{DIVIDER}")
+        print(f"  QA EXECUTION REPORT")
+        print(DIVIDER)
+        print(f"\n  [{bar}] {pass_rate:.1f}% passed\n")
+        print(f"  Total        : {total}")
+        print(f"  {TICK} Passed : {passed}")
+        print(f"  {CROSS} Failed : {failed}")
+
+        # Passed (compact)
+        if passed_list:
+            print(f"\n{SUBDIV}")
+            print(f"  {TICK}  PASSED ({len(passed_list)})\n")
+            for tc in passed_list:
+                tc_id = tc.get("test_case_id", "?")
+                desc  = (tc.get("description") or
+                         tc.get("test_case_name") or "")[:48]
+                print(f"  {TICK}  {tc_id:12s}  {desc}")
+
+        # Failed (detailed)
+        if failed_list:
+            print(f"\n{SUBDIV}")
+            print(f"  {CROSS}  FAILED ({len(failed_list)})\n")
+            for tc in failed_list:
+                tc_id   = tc.get("test_case_id", "?")
+                desc    = (tc.get("description") or
+                           tc.get("test_case_name") or "")
+                status  = str(tc.get("execution_status", "FAILED")).upper()
+                reason  = tc.get("failure_reason", "")
+                actual  = tc.get("actual_values", "")
+                expected= tc.get("expected_value", "")
+
+                icon = WARN if status == "SOFT_FAILURE" else CROSS
+                print(f"  {icon}  {tc_id} — {desc}")
+                if status == "SOFT_FAILURE":
+                    print(f"       Status   : SOFT FAILURE (missing rows)")
+                if reason:
+                    print(f"       Reason   : {reason}")
+                if expected:
+                    print(f"       Expected : {expected}")
+                if actual:
+                    print(f"       Actual   : {actual}")
+
+                # Show diagnostic sample rows if present
+                samples = tc.get("sample_values") or tc.get("diagnostic_rows")
+                if samples and isinstance(samples, list):
+                    print(f"       Sample mismatches:")
+                    print(_fmt_table(samples[:2]))
+                print()
+
+        print(f"\n{DIVIDER}\n")
         return
 
-    meta    = report.get("report_metadata", {})
-    summary = report.get("summary", {})
-    results = report.get("results", [])
+    # ── Fallback: parse plain text / YAML-like output from agent ─────────────
+    # The agent sometimes returns formatted text instead of JSON.
+    # Parse it into sections and display cleanly.
+    raw_str = str(raw).strip()
+    if not raw_str:
+        print(f"\n{WARN} No executor output received.")
+        return
 
-    env          = meta.get("environment", "unknown").upper()
-    mapping_file = meta.get("mapping_file", "unknown")
-    val_type     = meta.get("validation_type", "unknown")
-    executed_at  = meta.get("executed_at", "")
-
-    total     = summary.get("total_tests", len(results))
-    passed    = summary.get("passed", 0)
-    failed    = summary.get("failed", 0)
-    errors    = summary.get("errors", 0)
-    pass_rate = summary.get("pass_rate_pct", 0)
-
-    src = meta.get("source", {})
-    tgt = meta.get("target", {})
-
-    # ── Header ────────────────────────────────────────────────────────────────
     print(f"\n{DIVIDER}")
-    print(f"  QA EXECUTION REPORT  —  {env}")
-    print(f"  Mapping      : {mapping_file}")
-    print(f"  Validation   : {val_type}")
-    if src:
-        print(f"  Source       : {src.get('project_id','')}.{src.get('dataset','')}")
-    if tgt:
-        print(f"  Target       : {tgt.get('project_id','')}.{tgt.get('dataset','')}")
-    if executed_at:
-        print(f"  Executed at  : {executed_at}")
+    print(f"  QA EXECUTION REPORT")
     print(DIVIDER)
 
-    # ── Summary bar ───────────────────────────────────────────────────────────
-    bar_len  = 30
-    filled   = round((passed / total) * bar_len) if total > 0 else 0
-    bar      = ("█" * filled) + ("░" * (bar_len - filled))
+    # Extract summary line counts
+    total_match  = _re.search(r"total[_\s]test[_\s]cases[_\s]executed[:\s]+([\d]+)",
+                               raw_str, _re.IGNORECASE)
+    passed_match = _re.search(r"total[_\s]passed[:\s]+([\d]+)",
+                               raw_str, _re.IGNORECASE)
+    failed_match = _re.search(r"total[_\s]failed[:\s]+([\d]+)",
+                               raw_str, _re.IGNORECASE)
 
-    print(f"\n  [{bar}] {pass_rate:.1f}% passed\n")
-    print(f"  Total   : {total}")
-    print(f"  {TICK} Passed : {passed}")
-    print(f"  {CROSS} Failed : {failed}")
-    if errors:
-        print(f"  {WARN} Errors : {errors}")
+    if total_match or passed_match or failed_match:
+        total  = int(total_match.group(1))  if total_match  else "?"
+        passed = int(passed_match.group(1)) if passed_match else "?"
+        failed = int(failed_match.group(1)) if failed_match else "?"
 
-    # ── Passed tests (compact) ────────────────────────────────────────────────
-    passed_results = [r for r in results if r.get("status") == "PASS"]
-    if passed_results:
+        if isinstance(total, int) and isinstance(passed, int):
+            pass_rate = round((passed / total * 100), 1) if total > 0 else 0
+            bar_len   = 30
+            filled    = round((passed / total) * bar_len) if total > 0 else 0
+            bar       = ("█" * filled) + ("░" * (bar_len - filled))
+            print(f"\n  [{bar}] {pass_rate:.1f}% passed\n")
+
+        print(f"  Total        : {total}")
+        print(f"  {TICK} Passed : {passed}")
+        print(f"  {CROSS} Failed : {failed}")
+
+    # Extract individual test case blocks
+    # Look for patterns like "test_case_id: tc_001" or "- test_case_id: tc_001"
+    tc_blocks = _re.split(
+        r"(?=(?:-\s+)?test_case_id\s*:|(?:-\s+)?"test_case_id"\s*:)",
+        raw_str
+    )
+
+    passed_tcs = []
+    failed_tcs = []
+
+    for block in tc_blocks:
+        if not block.strip():
+            continue
+
+        tc_id_m  = _re.search(r"test_case_id["\s]*:["\s]*([\w\-]+)",
+                               block, _re.IGNORECASE)
+        status_m = _re.search(r"execution_status["\s]*:["\s]*(\w+)",
+                               block, _re.IGNORECASE)
+        reason_m = _re.search(r"failure_reason["\s]*:["\s]*(.+?)(?:\n|$)",
+                               block, _re.IGNORECASE)
+        actual_m = _re.search(r"actual_values["\s]*:["\s]*(.+?)(?:\n|$)",
+                               block, _re.IGNORECASE)
+        expect_m = _re.search(r"expected_value["\s]*:["\s]*(.+?)(?:\n|$)",
+                               block, _re.IGNORECASE)
+
+        if not tc_id_m:
+            continue
+
+        tc_id  = tc_id_m.group(1).strip()
+        status = status_m.group(1).strip().upper() if status_m else "UNKNOWN"
+
+        if status == "PASSED":
+            passed_tcs.append(tc_id)
+        else:
+            failed_tcs.append({
+                "tc_id":    tc_id,
+                "status":   status,
+                "reason":   reason_m.group(1).strip() if reason_m else "",
+                "actual":   actual_m.group(1).strip() if actual_m else "",
+                "expected": expect_m.group(1).strip() if expect_m else "",
+            })
+
+    if passed_tcs:
         print(f"\n{SUBDIV}")
-        print(f"  {TICK}  PASSED ({len(passed_results)})\n")
-        for r in passed_results:
-            ms  = r.get("execution_time_ms", 0)
-            print(f"  {TICK}  {r.get('test_case_id','?'):10s}  "
-                  f"{r.get('description','')[:45]:<45}  "
-                  f"({ms}ms)")
+        print(f"  {TICK}  PASSED ({len(passed_tcs)})\n")
+        for tc_id in passed_tcs:
+            print(f"  {TICK}  {tc_id}")
 
-    # ── Failed tests (detailed) ───────────────────────────────────────────────
-    failed_results = [r for r in results if r.get("status") == "FAIL"]
-    if failed_results:
+    if failed_tcs:
         print(f"\n{SUBDIV}")
-        print(f"  {CROSS}  FAILED ({len(failed_results)})\n")
-        for r in failed_results:
-            ms      = r.get("execution_time_ms", 0)
-            count   = r.get("mismatch_row_count", 0)
-            examples = r.get("mismatch_examples", [])
-
-            print(f"  {CROSS}  {r.get('test_case_id','?')} — "
-                  f"{r.get('description','')}")
-            print(f"       Mismatches : {count} row(s)  ({ms}ms)")
-
-            if examples:
-                print(f"       Example mismatches (up to {len(examples)}):")
-                print(_fmt_table(examples))
-            else:
-                print(f"       (No example rows available)")
+        print(f"  {CROSS}  FAILED ({len(failed_tcs)})\n")
+        for tc in failed_tcs:
+            icon = WARN if tc["status"] == "SOFT_FAILURE" else CROSS
+            print(f"  {icon}  {tc['tc_id']}")
+            if tc["status"] == "SOFT_FAILURE":
+                print(f"       Status   : SOFT FAILURE (missing rows)")
+            if tc["reason"]:
+                print(f"       Reason   : {tc['reason']}")
+            if tc["expected"]:
+                print(f"       Expected : {tc['expected']}")
+            if tc["actual"]:
+                print(f"       Actual   : {tc['actual']}")
             print()
 
-    # ── Errors ────────────────────────────────────────────────────────────────
-    error_results = [r for r in results if r.get("status") == "ERROR"]
-    if error_results:
-        print(f"\n{SUBDIV}")
-        print(f"  {WARN}  ERRORS ({len(error_results)})\n")
-        for r in error_results:
-            print(f"  {WARN}  {r.get('test_case_id','?')} — "
-                  f"{r.get('description','')}")
-            print(f"       {r.get('error_message','Unknown error')}\n")
+    # If we couldn't parse anything meaningful, show raw but cleaned up
+    if not passed_tcs and not failed_tcs and not total_match:
+        clean = raw_str.replace("\\n", "\n").replace("\\t", "  ")
+        print(f"\n{clean}")
 
     print(f"\n{DIVIDER}\n")
