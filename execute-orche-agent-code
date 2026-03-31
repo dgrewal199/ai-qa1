@@ -1,0 +1,78 @@
+_print_phase("PHASE 4: EXECUTE TEST CASES")
+        print(f"\n  Environment : {qa_service.get_selected_environment()}")
+ 
+        supervisor = sql_result.get("supervisor", {})
+        if supervisor.get("overall_status") == "manual_review_required":
+            print(f"\n  {WARN} Supervisor flagged issues — review report before executing.")
+ 
+        print("\n  Would you like to execute the test cases against BigQuery?")
+        print("  'yes' — execute  |  'no' — finish without executing")
+ 
+        exec_choice = input("\nYour response: ").strip().lower()
+ 
+        if exec_choice != "yes":
+            print("\n[INFO] Execution skipped. Workflow complete.")
+        else:
+            print("\n[SYSTEM] Executing test cases on BigQuery. Please wait...")
+ 
+            # Use supervisor-fixed SQL if available, otherwise approved SQL
+            sql_to_execute = (
+                json.dumps(supervisor.get("sql_fixed"), indent=2)
+                if supervisor.get("sql_fixed")
+                else approved_sql_json
+            )
+ 
+            executor_result = await qa_service._run_executor(
+                USER_ID, SESSION_ID, sql_to_execute
+            )
+ 
+            exec_output  = executor_result.get("execution_report", "")
+            exec_session = executor_result.get("session", {})
+ 
+            # ── Print agent output directly ───────────────────────────────────
+            print(f"\n{DIVIDER}")
+            print("  ✅  EXECUTION COMPLETE")
+            print(DIVIDER)
+ 
+            if exec_output:
+                # Clean up any literal \n sequences for readable output
+                clean_output = exec_output.replace("\\n", "\n").strip()
+                print(f"\n{clean_output}\n")
+            else:
+                print(f"\n  {WARN} No output received from executor agent.\n")
+ 
+            # ── Free-form Q&A with executor agent ─────────────────────────────
+            print(SUBDIV)
+            print("  The executor agent remembers everything it just ran.")
+            print("  Ask it anything — e.g. 'why did tc_002 fail?',")
+            print("  'show me the mismatched rows for tc_004',")
+            print("  'how many rows were affected?'")
+            print("  Type 'done' to finish.")
+            print(SUBDIV)
+ 
+            while True:
+                question = input("\nYou: ").strip()
+                if question.lower() in ("done", "exit", "quit", "q"):
+                    break
+                if not question:
+                    continue
+                chat_result = await qa_service.chat_with_executor(
+                    exec_session.get("user_id", USER_ID),
+                    exec_session.get("session_id", SESSION_ID + "_executor"),
+                    question,
+                )
+                agent_reply = chat_result.get("text", "").strip()
+                print(f"\nAgent: {agent_reply}\n")
+ 
+ 
+        # ── Final summary ─────────────────────────────────────────────────────
+        print(f"\n{DIVIDER}")
+        print("  ✅  QA WORKFLOW COMPLETE")
+        print(f"  Environment  : {qa_service.get_selected_environment()}")
+        print(f"  Validation   : {qa_service.get_selected_validation_type()}")
+        print(f"{DIVIDER}\n")
+ 
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] {e}")
+        raise
+ 
